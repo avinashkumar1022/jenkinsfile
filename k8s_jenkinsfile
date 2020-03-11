@@ -1,0 +1,246 @@
+GIT_BASE_URL = "https://vaprd078.schneider.com/schneider/"
+GIT_CREDENTIAL = 'eebde66b-39b8-4483-9ba0-7dc8d5d209da'
+GIT_DOMAIN = "vaprd078.schneider.com/schneider/"
+DOCKER_REGISTRY_URL = "dockerregistryunt1.intra.schneider.com"
+DOCKER_REGISTRY_USERNAME = "dockerregistry"
+DOCKER_REGISTRY_PASSWORD = "dockerregistry42018"
+DEPLOYMENT_ARTIFACTS_REPO = "foundation-deployment-artifacts"
+XL_DEPLOYIT_MANIFEST_FILE_NAME = "deployit-manifest.xml"
+K8S_DEPLOYMENT_YAML = "./deployment/deployment.yml"
+
+SERVICE_NAME = ServiceName.trim()
+GIT_BRANCH_NAME = GitBranchName.trim()
+ENV_PROFILE_NAME = "env"
+XLD_FOLDER = XLDFolder.trim()
+PROJECT_NAMESPACE = ProjectNamespace.trim()
+HAS_MAPR = HasMapr.trim()
+GIT_COMMIT_ID = GitCommitId.trim()
+
+XLD_RESOURCE_NODE = """<openshift.ResourcesFile name=\"/{{REPO_NAME}}-{{RESOURCE_FOLDER_NAME}}\" file=\"{{RESOURCE_FOLDER_PATH}}\"><tags><value>${PROJECT_NAMESPACE}</value></tags><scanPlaceholders>true</scanPlaceholders><preScannedPlaceholders>true</preScannedPlaceholders><placeholders /><delimiters>{{ }}</delimiters></openshift.ResourcesFile>"""
+
+node('prd-xebia-build-agent') {
+    stage("Execute Build Job - ${SERVICE_NAME}") {  
+
+        if(SERVICE_NAME == "") {
+            error "Build Parameter - ServiceName is missing"
+        }
+
+        if(GIT_BRANCH_NAME == "" && GIT_COMMIT_ID == "") {
+            error "Build Parameter - Either one of GitCommitId or GitBranchName is mandatory"
+        } 
+        
+        if (GIT_COMMIT_ID != "" && GIT_COMMIT_ID.length() < 7) {
+            error "Build Parameter - Must have atleast 7 characters for the gitCommitId"
+        }
+
+        if(ENV_PROFILE_NAME == "") {
+            error "Build Parameter - EnvProfileName is missing"
+        }
+
+        if(XLD_FOLDER == "") {
+            error "Build Parameter - XLDFolder is missing"
+        }
+
+        if(PROJECT_NAMESPACE == "") {
+            error "Build Parameter - ProjectNamespace is missing"
+        }
+
+        if(HAS_MAPR == "") {
+            error "Build Parameter - HasMapr is missing"
+        }
+
+        executeBuildFlowFor(SERVICE_NAME, GIT_BRANCH_NAME, GIT_COMMIT_ID)
+        println '********* Execute Build Job Successful **********'
+    }
+}
+
+def executeBuildFlowFor (repoName, branchName, gitCommitId) {
+    
+    stage("Git Checkout") {
+        println "******** Checking out source code from Git *********"
+        gitCheckoutFor(repoName, branchName, gitCommitId)
+        println "******** Git Checkout Successful *********"
+    }
+
+    stage("Update Pom For Release") {
+        println "******** Updating Pom For Release - Removing snapshot version and add a unique build # for release ***********"
+        if(GIT_COMMIT_ID) {
+            env.gitCommitId = GIT_COMMIT_ID.substring(0,7)
+        }
+        else {
+            env.gitCommitId = getLatestCommitIdFor(SERVICE_NAME, GIT_BRANCH_NAME)
+        }
+        env.datetime = new Date().format( 'yyyyMMddHHmmssSSS' )
+        jarFileName = updatePomForRelease(repoName, env.gitCommitId)
+        println "************* Update Pom For Release Successful *************"
+    }
+
+    stage("Build Jar") {
+        println "*********** Compiling maven project to build the jar *************"
+        executeMvnGoal(repoName, "-Dmaven.test.skip=true clean install package")
+        println "*********** Build Jar And Publish to Repository Successful *************"
+    }
+
+    stage("Build Docker Image") {
+        gitCheckoutFor(DEPLOYMENT_ARTIFACTS_REPO, "master", "")
+        if(HAS_MAPR.equalsIgnoreCase("NO")) {
+            FOLDER_NAME = "services"
+        }
+        else {
+            FOLDER_NAME = "mapr"
+        }
+        sh("cp ${repoName}/target/${jarFileName}.jar ./${DEPLOYMENT_ARTIFACTS_REPO}/${FOLDER_NAME}/${repoName}.jar")
+        sh "sed -i 's~{{SERVICE_NAME}}~${repoName}~g' ./${DEPLOYMENT_ARTIFACTS_REPO}/${FOLDER_NAME}/Dockerfile"
+        sh "sed -i 's~{{PROFILE_NAME}}~${ENV_PROFILE_NAME}~g' ./${DEPLOYMENT_ARTIFACTS_REPO}/${FOLDER_NAME}/config/application.yml"
+        sh "sed -i 's~{{REPO_NAME}}~${repoName}~g' ./${DEPLOYMENT_ARTIFACTS_REPO}/${FOLDER_NAME}/config/application.yml"
+        sh("docker build -t ${DOCKER_REGISTRY_URL}/${repoName}:9000${BUILD_NUMBER}-${env.gitCommitId} ./${DEPLOYMENT_ARTIFACTS_REPO}/${FOLDER_NAME}/")
+        println "*********** Build docker image And Publish to registry Successful *************"
+    }
+
+    stage("Push to Docker Registry") {
+        sh("docker login ${DOCKER_REGISTRY_URL} --username ${DOCKER_REGISTRY_USERNAME} --password ${DOCKER_REGISTRY_PASSWORD}")
+        sh("docker push ${DOCKER_REGISTRY_URL}/${repoName}:9000${BUILD_NUMBER}-${env.gitCommitId}")
+        sh("docker rmi ${DOCKER_REGISTRY_URL}/${repoName}:9000${BUILD_NUMBER}-${env.gitCommitId}")
+        println "*********** Pushing docker image to registry Successful *************"
+    }
+
+    stage("Build XL Deploy DAR Package") {
+        sh("cp -r ./${repoName}/k8s/* .")
+        sh "cp ./${DEPLOYMENT_ARTIFACTS_REPO}/xebia/${XL_DEPLOYIT_MANIFEST_FILE_NAME} ${XL_DEPLOYIT_MANIFEST_FILE_NAME}"
+
+        resourceFiles = sh(
+                    script: "find ./${repoName}/k8s/ -name '*.yml' -print",
+                    returnStdout: true
+            ).trim()
+
+        resourceFiles = resourceFiles.replace("./${repoName}/k8s", "")
+        println "************ Resources in k8s Folder ************"
+        println "${resourceFiles}"
+
+        xldResourcesNode = generateResourcesOnXLDManifestFile(repoName, resourceFiles)     
+        println("************* Generated XLD Resources Node *****************")
+        println "${xldResourcesNode}"
+
+        sh("sed -i 's~{{IMAGE_VERSION}}~9000${BUILD_NUMBER}-${env.gitCommitId}~g' ${K8S_DEPLOYMENT_YAML}");
+
+        sh("sed -i 's~minReadySeconds:[ 0-9]*~minReadySeconds: 10~g' ${K8S_DEPLOYMENT_YAML}");
+
+        sh("sed -i 's~{{ARTIFACT_VERSION}}~9000${BUILD_NUMBER}-${env.gitCommitId}~g' ${XL_DEPLOYIT_MANIFEST_FILE_NAME}");
+        sh("sed -i 's~{{XLD_FOLDER}}~${XLD_FOLDER}~g' ${XL_DEPLOYIT_MANIFEST_FILE_NAME}");
+
+        if(XLD_FOLDER.equalsIgnoreCase("Snapshots")) {
+            sh("sed -i 's~{{REPO_NAME}}~${repoName}-snapshot~g' ${XL_DEPLOYIT_MANIFEST_FILE_NAME}");
+        }
+        else {
+            sh("sed -i 's~{{REPO_NAME}}~${repoName}~g' ${XL_DEPLOYIT_MANIFEST_FILE_NAME}");
+        }
+
+        sh("sed -i 's~{{REPO_NAME}}~${repoName}~g' ${XL_DEPLOYIT_MANIFEST_FILE_NAME}");
+        sh("sed -i 's~{{XLD_RESOURCES_NODES}}~${xldResourcesNode}~g' ${XL_DEPLOYIT_MANIFEST_FILE_NAME}");
+
+        xldCreatePackage artifactsPath: "", manifestPath: "${XL_DEPLOYIT_MANIFEST_FILE_NAME}", darPath: '${serviceName}-${gitCommitId}.dar'
+        println "### Build XL Deploy DAR Package Successful ###";
+    }
+
+    stage('XL Deploy Publish') {  
+        xldPublishPackage serverCredentials: 'XldCreds', darPath: '${serviceName}-${gitCommitId}.dar'
+        println "Pushed docker image with version ${env.gitCommitId}"
+        println "Cleaning up workspace ..."
+        deleteDir()
+        println "### XL Deploy Publish Successful ###"
+    }   
+}
+
+def gitCheckoutFor(repoName, branchName, gitCommitId) {
+    withCredentials([
+         [$class: 'UsernamePasswordMultiBinding', credentialsId: GIT_CREDENTIAL, usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_PASSWORD']
+        ]) {
+            def repoUrl = repoName + '.git'
+            println "Pulling code for repoUrl =" + repoUrl
+            sh("rm -rf ${repoName}")
+            if(gitCommitId) {
+                println "Checking out using git commit id for ${repoName}"
+                sh("git clone https://${GIT_USERNAME}:${GIT_PASSWORD}@${GIT_DOMAIN}${repoUrl} ${repoName}")
+                sh("git -C ./${repoName} reset --hard ${gitCommitId}")
+            }
+            else if(branchName) {
+                println "Checking out using branch name for ${repoName}"
+                sh("git clone --branch ${branchName} https://${GIT_USERNAME}:${GIT_PASSWORD}@${GIT_DOMAIN}${repoUrl} ${repoName}")
+            }
+            else {
+                error "Both branchName and gitCommitId are null, Either one of them is mandatory"
+            }
+        }
+}
+
+def getLatestCommitIdFor(repoName, branchName) {
+    withCredentials([
+         [$class: 'UsernamePasswordMultiBinding', credentialsId: GIT_CREDENTIAL, usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_PASSWORD']
+         ]) {
+            latestGitCommitId = sh(
+                    script: "git ls-remote https://${GIT_USERNAME}:${GIT_PASSWORD}@${GIT_DOMAIN}${repoName} ${branchName} | cut -f1",
+                    returnStdout: true
+            ).trim()
+        }
+    return latestGitCommitId.substring(0,7)
+}
+
+def updatePomForRelease(repoName, gitCommitId) {
+    def pom = readMavenPom file: repoName + '/pom.xml'
+    def version = ""
+
+    try {
+        if(pom.version.contains("-SNAPSHOT")) {
+            version = pom.version.replace("-SNAPSHOT", ".${gitCommitId}")
+         }
+        else {
+            version = pom.version+".${gitCommitId}"
+        }
+    }
+    catch (Exception e) {
+        println "Version tag is missing in pom.xml for " + repoName
+        sh "exit 1"
+    }
+ 
+    executeMvnGoal(repoName, "versions:set versions:commit -DnewVersion=${version}")
+    def jarFileName = pom.artifactId + "-" + version   
+    return jarFileName
+}
+
+def executeMvnGoal(repoName, mvnGoal) {
+    withMaven(
+        maven: 'M3',
+        mavenSettingsConfig: '861beabf-0e69-49b4-bc3c-aa5de0b1eb7e',
+        mavenLocalRepo: '.repository'
+    ) {
+        sh "mvn -f ./${repoName}/pom.xml ${mvnGoal}"
+    }
+}
+
+def generateResourcesOnXLDManifestFile(repoName, resourceFiles) {
+    def xldResourcesNode = "";
+    ymlFiles = resourceFiles.split('\n');
+
+    def resourceNames = ["configmap", "secret", "deployment", "service", "route"]
+    def order = 1
+    
+    for(int index=0; index < resourceNames.size(); index++) {
+        ymlFiles.each() {
+            if(it) {
+                if(it.contains(resourceNames[index])) {
+                    resourceNode = "${XLD_RESOURCE_NODE}";
+                    resourceNode = resourceNode.replace("{{RESOURCE_FOLDER_PATH}}", it);
+                    resourceNode = resourceNode.replace("{{REPO_NAME}}", order + "-" + repoName);
+                    println "Updating resource file name for ${resourceNames[index]} = " + it.contains(resourceNames[index])
+                    resourceNode = resourceNode.replace("{{RESOURCE_FOLDER_NAME}}", it.split("/")[2]);
+                    order++
+                    xldResourcesNode = xldResourcesNode + resourceNode;
+                }
+            }
+            else {
+                error "Unable to retrieve the Yml files inside k8s folder for ${repoName}";
+            }
+        }
+    }
+    return xldResourcesNode;
+}
