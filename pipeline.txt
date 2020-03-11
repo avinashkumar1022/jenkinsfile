@@ -1,0 +1,91 @@
+GIT_BASE_URL = "https://vaprd078.schneider.com/schneider/"
+GIT_CREDENTIAL = 'internalgithub-snideployer'
+GIT_DOMAIN = "vaprd078.schneider.com/schneider/"
+
+APP_CENTER_TOKEN= "azure-app-center-token"
+
+GIT_CLOUD_BASE_URL = "git@github.com:schneidertech/"
+GIT_CLOUD_CREDENTIAL = 'externalgithub-snideployer'
+
+GIT_BRANCH_NAME = GitBranchName.trim()
+REPO_LOCATION = GitRepoLocation.trim()
+REPO_NAME = GitRepoName.trim()
+
+node('uxunt2203') {
+    stage("Execute Build Job") {  
+        executeBuildFlowFor(REPO_NAME, GIT_BRANCH_NAME)
+        println '********* Build Job Successful **********'
+    }
+}
+
+def executeBuildFlowFor (repoName, branchName) {
+    stage("Git Checkout") {
+        if(REPO_LOCATION == "Cloud") {
+            println "******** Checking out source code from External Git *********"
+            dir(path: "${repoName}") {
+                def repoUrl = GIT_CLOUD_BASE_URL + repoName + '.git'
+                git branch: branchName, credentialsId: 'externalgithub-snideployer', url: repoUrl
+                env.gitCommitId = sh(returnStdout: true, script: "git log -n 1 --pretty=format:'%h'").take(7)
+                println "******** External Git Checkout Successful *********"
+            }
+        }
+        else {
+            println "******** Checking out source code from Internal Git *********"
+            gitCheckoutFor(repoName, branchName)
+            env.gitCommitId = getLatestCommitIdFor(repoName, branchName)
+            println "******** Internal Git Checkout Successful *********"
+        }
+    }
+
+    stage("Run npm build and add ionic and capacitor modules for Android") {
+        println "*********** Adding Capacitor Dependencies *************"
+        dir(path: "${repoName}/main") {
+            sh "npm install ionic"
+            sh "npm install react-scripts"
+            sh "npm install @ionic/react-hooks"
+            sh "npm install --force node-sass"
+            sh "npm run build"
+            sh "npm install @capacitor/core @capacitor/cli"
+            sh "npx cap init"
+            sh "npx cap add android"
+            sh "npx cap sync"
+        }
+        println "*********** Adding ionic and capacitor dependencies successful *************"
+    }
+
+    stage("Gradle Build APK") {
+        println "*********** Building APK *************"
+        dir(path: "${repoName}/main") {
+            sh "gradlew build"
+        }
+        println "*********** Building APK Successful *************"
+    }
+    stage("Publish to Azure App Center") {
+        dir(path: "${repoName}") {
+            appCenter apiToken: APP_CENTER_TOKEN, appName: 'Carrier Experience', distributionGroups: 'testers,developers', notifyTesters: true, ownerName: 'Schneider', pathToApp: 'output/apk/', pathToDebugSymbols: '', releaseNotes: 'New App'
+        }
+    }    
+}
+
+def gitCheckoutFor(repoName, branchName) {
+    withCredentials([
+         [$class: 'UsernamePasswordMultiBinding', credentialsId: GIT_CREDENTIAL, usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_PASSWORD']
+        ]) {
+            def repoUrl = repoName + '.git'
+            println "Pulling code for repoUrl =" + repoUrl
+            sh("rm -rf ${repoName}")
+            sh("git clone --branch ${branchName} https://${GIT_USERNAME}:${GIT_PASSWORD}@${GIT_DOMAIN}${repoUrl} ${repoName}")
+        }
+}
+
+def getLatestCommitIdFor(repoName, branchName) {
+    withCredentials([
+         [$class: 'UsernamePasswordMultiBinding', credentialsId: GIT_CREDENTIAL, usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_PASSWORD']
+         ]) {
+            latestGitCommitId = sh(
+                    script: "git ls-remote https://${GIT_USERNAME}:${GIT_PASSWORD}@${GIT_DOMAIN}${repoName} ${branchName} | cut -f1",
+                    returnStdout: true
+            ).trim()
+        }
+    return latestGitCommitId.substring(0,7)
+}
